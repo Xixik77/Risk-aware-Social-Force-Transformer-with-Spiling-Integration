@@ -1,0 +1,36 @@
+import os
+import torch
+from dataloader import Dataloader
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(ROOT, "data", "ETH", "txt")
+
+def build(split, txt_name):
+    txt_path = os.path.join(DATA_DIR, txt_name)
+
+    # 这里的 dataset_name / dataset_type 会决定 pkl 的名字：toy_train.pkl / toy_test.pkl
+    ds = Dataloader(
+        files=[txt_path],
+        ob_horizon=4,
+        pred_horizon=2,
+        batch_size=2,
+        drop_last=False,
+        shuffle=False,
+        batches_per_epoch=None,
+        frameskip=1,
+        inclusive_groups=None,
+        batch_first=True,
+        seed=0,
+        device=torch.device("cpu"),
+        flip=False, rotate=False, scale=False,
+        dataset_name="toy",
+        dataset_type=split,
+    )
+
+    print(f"{split} 集：总样本数 = {len(ds)}")
+    # 注意：Dataloader 内部已经把 (hist,future,neighbor) 存成 toy_{split}.pkl 了
+
+if __name__ == "__main__":
+    build("train", "toy.txt")   # 简单起见 train / test 都用一个 txt
+    build("test",  "toy.txt")
+    print("\n已在 data/ETH/txt 生成 toy_train.pkl 和 toy_test.pkl")
