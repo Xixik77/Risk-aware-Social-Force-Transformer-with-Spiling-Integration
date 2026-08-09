@@ -1,0 +1,356 @@
+import torch
+import torch.nn as nn
+from Decoder import Decoder
+
+from Encoder import Encoder
+
+
+# -------------------- 复用的块 --------------------
+class FeedForwardLayer(nn.Module):
+    def __init__(self, d_model, forward_expansion):
+        super().__init__()
+        self.w1 = nn.Linear(d_model, d_model * forward_expansion)
+        self.w2 = nn.Linear(d_model * forward_expansion, d_model)
+
+    def forward(self, x):
+        return self.w2(nn.functional.relu(self.w1(x)))
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, embedding_dim, eps=1e-6):
+        super().__init__()
+        self.a = nn.Parameter(torch.ones(embedding_dim))
+        self.b = nn.Parameter(torch.zeros(embedding_dim))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a * (x - mean) / (std + self.eps) + self.b
+
+
+class MultihHeadAttention(nn.Module):
+    def __init__(self, d_model, h, dropout=0.1):
+        super().__init__()
+        assert d_model % h == 0
+        self.d_k = d_model // h
+        self.h = h
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model)
+        self.w_v = nn.Linear(d_model, d_model)
+        self.fc = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, q, k, v, mask=None):
+        B, Lq, E = q.shape
+        h = self.h
+        d_k = self.d_k
+        q = self.w_q(q).view(B, Lq, h, d_k).transpose(1, 2)
+        k = self.w_k(k).view(B, -1, h, d_k).transpose(1, 2)
+        v = self.w_v(v).view(B, -1, h, d_k).transpose(1, 2)
+        scores = (q @ k.transpose(-2, -1)) / (d_k ** 0.5)
+        if mask is not None:
+            scores = scores.masked_fill(mask[:, None, :, :] == 0, -1e9)
+        attn = self.drop(scores.softmax(dim=-1))
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, Lq, h * d_k)
+        return self.fc(out)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_size, head, forward_expansion, dropout):
+        super().__init__()
+        self.attn = MultihHeadAttention(embed_size, head, dropout)
+        self.norm1 = LayerNorm(embed_size)
+        self.norm2 = LayerNorm(embed_size)
+        self.ffn = FeedForwardLayer(embed_size, forward_expansion)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, q, k, v, mask):
+        x = self.attn(q, k, v, mask)
+        x = self.drop(self.norm1(x + q))
+        y = self.ffn(x)
+        return self.drop(self.norm2(y + x))
+
+
+# ---- 轻量时序编码器：2D -> E（取最后一步）----
+class TinyTemporalEncoder(nn.Module):
+    def __init__(self, in_size=2, embed_size=128, num_layers=2, heads=4, ff_exp=4, dropout=0.1, pool="last"):
+        super().__init__()
+        self.input_proj = nn.Linear(in_size, embed_size)
+        self.pos_embed = nn.Parameter(torch.randn(1, 512, embed_size) * 0.01)  # 简单PE
+        self.layers = nn.ModuleList([TransformerBlock(embed_size, heads, ff_exp, dropout)
+                                     for _ in range(num_layers)])
+        self.pool = pool
+
+    def forward(self, x):  # x: [B, L, 2]
+        B, L, _ = x.shape
+        h = self.input_proj(x)  # [B,L,E]
+        h = h + self.pos_embed[:, :L, :]
+        for blk in self.layers:
+            h = blk(h, h, h, mask=None)  # 自注意力
+        if self.pool == "last":
+            return h[:, -1, :]  # [B,E]
+        if self.pool == "mean":
+            return h.mean(dim=1)  # [B,E]
+        return h  # [B,L,E]
+
+
+# --------------------- TrajectoryModel ---------------------
+class TrajectoryModel(nn.Module):
+    def __init__(self, in_size, obs_len, pred_len, embed_size,
+                 enc_num_layers, int_num_layers_list, heads, forward_expansion, use_snn=True, use_social_force=True):
+        super().__init__()
+        self.in_size = in_size
+        self.obs_len = obs_len
+        self.pred_len = pred_len
+        self.embed_size = embed_size
+        self.use_snn = use_snn
+        self.use_social_force = use_social_force
+
+        # 主体/模式编码：时间编码器（输出一个向量 E）
+        # self.mode_temporal_encoder = TinyTemporalEncoder(
+        #     in_size=in_size, embed_size=embed_size,
+        #     num_layers=enc_num_layers, heads=heads, ff_exp=forward_expansion,
+        #     dropout=0.1, pool="last"
+        # )
+        # self.cls_head = nn.Linear(embed_size, 1)  # [B,K,E] -> [B,K,1]                          #打分
+        #
+        # # 邻居编码：同样用时间编码器（每个邻居 obs_len → 一个向量）
+        # self.nei_temporal_encoder = TinyTemporalEncoder(
+        #     in_size=in_size, embed_size=embed_size,
+        #     num_layers=enc_num_layers, heads=heads, ff_exp=forward_expansion,
+        #     dropout=0.1, pool="last"
+        # )
+        self.mode_temporal_encoder = Encoder(
+            embed_size=embed_size,
+            num_layers=enc_num_layers,
+            heads=heads,
+            forward_expansion=forward_expansion,
+            dropout=0.1,
+            islinear=True,
+            use_snn=self.use_snn
+        )
+        self.cls_head = nn.Linear(embed_size, 1)  # [B,K,E] -> [B,K,1]
+
+        # 邻居编码：同样用 Encoder（结构统一）
+        self.nei_temporal_encoder = Encoder(
+            embed_size=embed_size,
+            num_layers=enc_num_layers,
+            heads=heads,
+            forward_expansion=forward_expansion,
+            dropout=0.1,
+            islinear=True
+        )
+        self.force_mlp = nn.Sequential(
+            nn.Linear(2, embed_size),
+            nn.ReLU(),
+            nn.Linear(embed_size, embed_size),
+        )
+
+
+        # 交互：沿用你的 Decoder（Q=[B,K,E], K/V=[B,N,E], mask=[B,K,N]）
+        self.social_decoder = Decoder(embed_size, int_num_layers_list[1], heads, forward_expansion,
+                                      dropout=0.1, islinear=True, use_snn=False, )
+
+        # 回归：E -> pred_len*2
+        self.reg_head = nn.Linear(embed_size, in_size * pred_len)
+
+    # ========= 新增：社会力计算 =========
+    def compute_social_force(self, ped_obs, neis_obs, valid_nei_mask,
+                             A=2.0, d0=0.8, R=3.0):
+        """
+        简化社会力模型：只用人-人排斥力
+        ped_obs:      [B, T_obs, 2]           目标行人历史
+        neis_obs:     [B, N, T_obs, 2]        邻居历史
+        valid_nei_mask: [B, N]  True/False    哪些邻居有效
+        返回:
+            F: [B, T_obs, 2]  每一帧的合社会力 (Fx, Fy)
+        """
+        device = ped_obs.device
+        B, T_obs, _ = ped_obs.shape
+        _, N, _, _ = neis_obs.shape
+
+        # [B,1,T,2] - [B,N,T,2] -> [B,N,T,2]
+        ped = ped_obs.unsqueeze(1)           # [B,1,T,2]
+        nei = neis_obs                      # [B,N,T,2]
+        delta = ped - nei                   # [B,N,T,2]  从邻居指向行人
+
+        dist = torch.norm(delta, dim=-1, keepdim=True)  # [B,N,T,1]
+        eps = 1e-6
+
+        # 有效邻居掩码 + 距离阈值 R
+        mask_valid = valid_nei_mask.unsqueeze(-1).unsqueeze(-1)     # [B,N,1,1]
+        mask_radius = dist < R                                      # [B,N,T,1]
+        mask = mask_valid & mask_radius                             # bool
+
+        # 力的大小：A * exp(-d/d0)
+        force_mag = A * torch.exp(-dist / d0)                       # [B,N,T,1]
+        # 方向：delta / dist
+        force_dir = delta / (dist + eps)                            # [B,N,T,2]
+
+        force_vec = force_mag * force_dir                           # [B,N,T,2]
+        force_vec = force_vec * mask.float()                        # 无效的强制为 0
+
+        # 对所有邻居求和 -> 合力 [B,T,2]
+        F = force_vec.sum(dim=1)                                    # [B,T,2]
+        return F
+    # ========= 社会力计算结束 =========
+    def compute_pairwise_social_force(self, ped_obs, neis_obs, valid_nei_mask,
+                                      A=2.0, d0=0.8, R=3.0):
+        """
+        返回每个邻居对目标的力（不求和）
+        ped_obs:         [B, T_obs, 2]
+        neis_obs:        [B, N, T_obs, 2]
+        valid_nei_mask:  [B, N] bool
+        return:
+            F_pair:      [B, N, T_obs, 2]
+        """
+        ped = ped_obs.unsqueeze(1)  # [B,1,T,2]
+        nei = neis_obs  # [B,N,T,2]
+        delta = ped - nei  # [B,N,T,2]  从邻居指向目标
+
+        dist = torch.norm(delta, dim=-1, keepdim=True)  # [B,N,T,1]
+        eps = 1e-6
+
+        mask_valid = valid_nei_mask.unsqueeze(-1).unsqueeze(-1)  # [B,N,1,1]
+        mask_radius = dist < R  # [B,N,T,1]
+        mask = mask_valid & mask_radius  # bool
+
+        force_mag = A * torch.exp(-dist / d0)  # [B,N,T,1]
+        force_dir = delta / (dist + eps)  # [B,N,T,2]
+        F_pair = (force_mag * force_dir) * mask.float()  # [B,N,T,2]
+        return F_pair
+
+    def spatial_interaction(self, ped_feat_q, ped_obs, neis_obs, valid_nei_mask):
+        """
+        ped_feat_q:     期望 [B, K, E]；若误传成 ≥3 维会在此压成 [B,K,E]
+        neis_obs:       [B, N, obs_len, 2]
+        valid_nei_mask: [B, N] (bool)
+        """
+        # === 统一压成 [B, K, E]（最保险）===
+        if ped_feat_q.dim() != 3:
+            B = ped_feat_q.size(0)
+            E = ped_feat_q.size(-1)        # 最后一维必然是 E
+            ped_feat_q = ped_feat_q.reshape(B, -1, E)  # 合并中间所有维到 K
+
+        B, K, E = ped_feat_q.shape
+        Bn, N, L, C = neis_obs.shape
+        assert B == Bn and L == self.obs_len and C == self.in_size
+
+        # 编邻居 [B,N,obs,2] -> [B*N,obs,2] -> [B*N,E] -> [B,N,E]
+        # neis_flat = neis_obs.reshape(B * N, L, C)
+        # nei_vec = self.nei_temporal_encoder(neis_flat).view(B, N, E)
+
+        # 编邻居 [B,N,obs,2] -> [B*N,obs,2] -> [B*N,obs,6] -> [B*N,E] -> [B,N,E]
+        neis_flat = neis_obs.reshape(B * N, L, C)                   # [B*N,obs,2]
+
+        neis_flat_6 = torch.zeros(B * N, L, 6, device=neis_flat.device, dtype=neis_flat.dtype)
+        neis_flat_6[..., :2] = neis_flat                            # (x,y) 填前两维
+
+        nei_seq = self.nei_temporal_encoder(neis_flat_6)            # [B*N,obs,E]
+        nei_vec = nei_seq[:, -1, :].view(B, N, E)                   # [B,N,E]
+
+        # --- 方案B：社会力作为邻居 message 注入 ---
+        # 1) 计算 pairwise force: [B,N,T_obs,2]
+        F_pair = self.compute_pairwise_social_force(ped_obs, neis_obs, valid_nei_mask)
+
+        # 2) 时间聚合到每个邻居一个力向量： [B,N,2]
+        F_agg = F_pair.mean(dim=2)  # 推荐：更平滑
+        # F_agg = F_pair[:, :, -1, :]       # 可选：只用最后一帧
+
+        # 3) 编码到 E 维并融合进邻居向量
+        force_msg = self.force_mlp(F_agg)  # [B,N,E]
+        nei_vec = nei_vec + force_msg  # [B,N,E]
+
+        # 交互 mask: [B,K,N]
+        mask_kn = valid_nei_mask.to(torch.bool).unsqueeze(1).expand(B, K, N)
+
+        # 交互
+        int_feat = self.social_decoder(ped_feat_q, nei_vec, mask_kn)  # [B,K,E]
+        return int_feat
+
+    def forward(self, ped_obs, neis_obs, motion_modes, valid_nei_mask, closest_mode_indices, test=False, num_k=20):
+        """
+        ped_obs:              [B, obs_len, 2]
+        neis_obs:             [B, N, obs_len, 2]
+        motion_modes:         [K, pred_len, 2]
+        valid_nei_mask:       [B, N] (bool)
+        closest_mode_indices: [B] (LongTensor，训练用)
+        """
+
+        B = ped_obs.size(0)
+        Km = motion_modes.size(0)  # 模式数 K
+        L = self.obs_len + self.pred_len
+
+        # ===== 1) 先计算目标行人的社会力轨迹 F_hist: [B, T_obs, 2] =====
+        # 注意：这里用的是 obs 段的 neis_obs，valid_nei_mask 是你 collate 里算的有效邻居布尔掩码
+        F_hist = self.compute_social_force(ped_obs, neis_obs, valid_nei_mask)  # [B, T_obs, 2]
+
+        # ===== 2) 拼接主体观测 + 候选模式 → [B,K,obs+pred,2] =====
+        ped_rep = ped_obs.unsqueeze(1).repeat(1, Km, 1, 1)  # [B,K,obs,2]
+        mode_rep = motion_modes.unsqueeze(0).repeat(B, 1, 1, 1)  # [B,K,pred,2]
+        seq_bk = torch.cat([ped_rep, mode_rep], dim=2)  # [B,K,obs+pred,2]
+
+        # ===== 3) BK 合并批次，构造 6 维输入给 Encoder =====
+        seq_bk = seq_bk.view(B * Km, L, self.in_size)  # [B*K,L,2]
+
+        # 构造 [B*K,L,6]，前 2 维放 (x,y)
+        seq_bk_6 = torch.zeros(B * Km, L, 6, device=seq_bk.device, dtype=seq_bk.dtype)
+        seq_bk_6[..., :2] = seq_bk  # 0,1 维 = (x,y)
+
+        # ===== 4) 把社会力 F_hist 填到第 2~4 维（只填观测段，预测段全 0） =====
+
+        F_rep = F_hist.unsqueeze(1).repeat(1, Km, 1, 1)  # [B,K,T_obs,2]
+        F_flat = F_rep.view(B * Km, self.obs_len, 2)  # [B*K,T_obs,2]
+
+        seq_bk_6[:, :self.obs_len, 2:4] = F_flat  # 2,3 维 = (Fx, Fy)
+        # 4,5 维目前先留空 0，将来可以放速度、相对位移等
+
+        # ===== 5) Encoder + SNN 做时间编码 =====
+        feat_bk_seq = self.mode_temporal_encoder(seq_bk_6)  # [B*K,L,E]
+        feat_bk = feat_bk_seq[:, -1, :]  # [B*K,E]
+        ped_feat = feat_bk.view(B, Km, self.embed_size)  # [B,K,E]
+
+        # 3) 模式打分 [B,K]
+        scores = self.cls_head(ped_feat).squeeze(-1)
+
+        if not test:
+            # 4) 选最近的一个模式做回归
+            if closest_mode_indices is None:
+                raise ValueError("closest_mode_indices 不能为 None；请传入形状 [B] 的 LongTensor。")
+
+            # 若传来的是 [B,M]（比如 top-k）或 soft/one-hot，统一变成 [B] 的类别索引
+            if closest_mode_indices.dim() > 1:
+                if closest_mode_indices.dtype == torch.long:
+                    closest_mode_indices = closest_mode_indices[:, 0]
+                else:
+                    closest_mode_indices = closest_mode_indices.argmax(dim=-1)
+
+            assert closest_mode_indices.shape == (B,), \
+                f"closest_mode_indices 期望 [B]，但拿到 {tuple(closest_mode_indices.shape)}"
+
+            idx_b = torch.arange(B, device=ped_obs.device)
+
+            closest_feat = ped_feat[idx_b, closest_mode_indices].unsqueeze(1)  # [B,1,E]
+
+            int_feat = self.spatial_interaction(closest_feat, ped_obs, neis_obs, valid_nei_mask)
+
+            # 若极少情况下返回了 [B,K,E]，均值压到 [B,E]
+            if int_feat.dim() == 3 and int_feat.size(1) != 1:
+                int_feat = int_feat.mean(dim=1)  # [B,E]
+            else:
+                int_feat = int_feat.squeeze(1)   # [B,E]
+
+            pred_traj = self.reg_head(int_feat).view(B, self.pred_len, self.in_size)  # [B,pred,2]
+            return pred_traj, scores
+
+
+
+        # ===== 测试路径（top-k） =====
+        top_k = min(num_k, Km)
+        top_k_idx = torch.topk(scores, k=top_k, dim=-1).indices                       # [B,top_k]
+        top_k_feat = ped_feat.gather(1, top_k_idx.unsqueeze(-1).expand(-1, -1, self.embed_size))  # [B,top_k,E]
+        int_feats = self.spatial_interaction(top_k_feat, ped_obs, neis_obs, valid_nei_mask)
+
+        pred_trajs = self.reg_head(int_feats).view(B, top_k, self.pred_len, self.in_size)  # [B,top_k,pred,2]
+        return pred_trajs, scores
