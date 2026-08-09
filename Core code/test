@@ -1,0 +1,226 @@
+# test.py
+import argparse
+import os
+import random
+import numpy as np
+import torch
+import importlib
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from dataset import TrajectoryDataset
+from TrajectoryModel import TrajectoryModel
+from utils import get_motion_modes
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
+
+
+@torch.no_grad()
+def evaluate(model, test_loader, motion_modes, device, obs_len, num_k=20, save_traj=False, out_dir=None):
+    """
+    返回：ade, fde, num_traj
+    可选保存：每条样本的 best 轨迹（minADE对应的那条），便于可视化/复现实验
+    """
+    model.eval()
+    ade_sum, fde_sum, num_traj = 0.0, 0.0, 0
+
+    saved_preds = []  # list of [T_pred,2]
+    saved_gts = []    # list of [T_pred,2]
+
+    for ped, neis, mask in test_loader:
+        ped = ped.to(device)
+        neis = neis.to(device)
+        mask = mask.to(device)
+
+        ped_obs = ped[:, :obs_len]
+        gt = ped[:, obs_len:]
+        neis_obs = neis[:, :, :obs_len]
+
+        # 折叠邻居 mask 到 [B,N]
+        if mask.dim() == 3:
+            valid_nei = mask.any(dim=-1)
+        else:
+            valid_nei = mask
+
+        # 推理：top-k
+        pred_trajs, scores = model(
+            ped_obs=ped_obs,
+            neis_obs=neis_obs,
+            motion_modes=motion_modes,
+            valid_nei_mask=valid_nei,
+            closest_mode_indices=None,
+            test=True,
+            num_k=num_k
+        )  # [B, K, T_pred, 2]
+
+        B, Kp, T, _ = pred_trajs.shape
+        gt_ = gt.unsqueeze(1).expand(B, Kp, T, 2)          # [B,K,T,2]
+        dist = torch.norm(pred_trajs - gt_, dim=-1)        # [B,K,T]
+        ade = dist.mean(dim=-1)                            # [B,K]
+        fde = dist[:, :, -1]                               # [B,K]
+
+        # 每个样本选 minADE 对应的那条轨迹
+        best_k = torch.argmin(ade, dim=-1)                 # [B]
+        min_ade = ade.min(dim=-1).values                   # [B]
+        min_fde = fde.gather(1, best_k.view(-1, 1)).squeeze(1)  # [B]
+
+        ade_sum += min_ade.sum().item()
+        fde_sum += min_fde.sum().item()
+        num_traj += B
+
+        if save_traj:
+            # 取出 best 轨迹与 gt（搬到CPU）
+            for b in range(B):
+                k = best_k[b].item()
+                saved_preds.append(pred_trajs[b, k].detach().cpu().numpy())  # [T,2]
+                saved_gts.append(gt[b].detach().cpu().numpy())               # [T,2]
+
+    ade_final = ade_sum / max(1, num_traj)
+    fde_final = fde_sum / max(1, num_traj)
+
+    if save_traj and out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        np.save(os.path.join(out_dir, "best_pred_trajs.npy"), np.array(saved_preds, dtype=object))
+        np.save(os.path.join(out_dir, "gt_trajs.npy"), np.array(saved_gts, dtype=object))
+        print(f"[Saved] trajectories to: {out_dir}")
+
+    return ade_final, fde_final, num_traj
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset_path', type=str, default=r'E:\bg\DL\Trans\data\data switch\citr_pkl')
+    parser.add_argument('--dataset_name', type=str, default='citr')
+    parser.add_argument(
+        '--hp_config',
+        type=str,
+        default='config/ETH_config.py',  # ← 改这里
+        help='same hp_config used in training'
+    )
+    parser.add_argument('--obs_len', type=int, default=8)
+    parser.add_argument('--pred_len', type=int, default=12)
+    parser.add_argument('--seed', type=int, default=1)
+    parser.add_argument('--gpu', type=str, default='0')
+    parser.add_argument('--num_works', type=int, default=8)
+
+    parser.add_argument('--checkpoint', type=str, default='./checkpoint/')
+    parser.add_argument('--ckpt_name', type=str, default='best.pth', help='best.pth or last.pth')
+
+    parser.add_argument('--use_snn', type=int, default=1, help='1=use snn, 0=disable snn')
+    parser.add_argument('--use_social_force', type=int, default=1, help='1=use social force, 0=disable')
+
+    parser.add_argument('--num_k', type=int, default=20)
+    parser.add_argument('--save_traj', action='store_true', help='save best pred traj & gt to npy')
+    args = parser.parse_args()
+    print(args)
+
+    # seeds
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+
+    # device
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # load hp_config
+    spec = importlib.util.spec_from_file_location("hp_config", args.hp_config)
+    hp_config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hp_config)
+
+    # test dataset/loader
+    test_dataset = TrajectoryDataset(
+        dataset_path=args.dataset_path,
+        dataset_name=args.dataset_name,
+        dataset_type='test',
+        translation=True,
+        rotation=True,
+        scaling=False,
+        obs_len=args.obs_len
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        collate_fn=test_dataset.coll_fn,
+        batch_size=hp_config.batch_size,
+        shuffle=False,
+        num_workers=args.num_works
+    )
+
+    # motion modes (load existing if present; otherwise build from train set)
+    motion_modes_file = os.path.join(args.dataset_path, args.dataset_name + '_motion_modes.pkl')
+    if not os.path.exists(motion_modes_file):
+        # 需要 train_dataset 来聚类 motion modes（与你 train.py 一致）
+        train_dataset = TrajectoryDataset(
+            dataset_path=args.dataset_path,
+            dataset_name=args.dataset_name,
+            dataset_type='train',
+            translation=True,
+            rotation=True,
+            scaling=True,
+            obs_len=args.obs_len,
+            dist_threshold=hp_config.dist_threshold,
+            smooth=False
+        )
+        print('motion modes generating ... ')
+        motion_modes_np = get_motion_modes(
+            train_dataset, args.obs_len, args.pred_len, hp_config.n_clusters,
+            args.dataset_path, args.dataset_name,
+            smooth_size=hp_config.smooth_size,
+            random_rotation=hp_config.random_rotation,
+            traj_seg=hp_config.traj_seg
+        )
+        motion_modes = torch.tensor(motion_modes_np, dtype=torch.float32, device=device)
+    else:
+        print('motion modes loading ... ')
+        import pickle
+        with open(motion_modes_file, 'rb') as f:
+            motion_modes_np = pickle.load(f)
+        motion_modes = torch.tensor(motion_modes_np, dtype=torch.float32, device=device)
+
+    # build model (与你 train.py 一致)
+    model = TrajectoryModel(
+        in_size=2,
+        obs_len=args.obs_len,
+        pred_len=args.pred_len,
+        embed_size=hp_config.model_hidden_dim,
+        enc_num_layers=2,
+        int_num_layers_list=[1, 1],
+        heads=4,
+        forward_expansion=2,
+        use_snn=bool(args.use_snn),
+        use_social_force=bool(args.use_social_force),
+    ).to(device)
+
+    # load ckpt
+    ckpt_path = os.path.join(args.checkpoint, args.dataset_name, args.ckpt_name)
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state, strict=True)
+    print(f"[Loaded] {ckpt_path}")
+
+    # run final test once
+    out_dir = os.path.join(args.checkpoint, args.dataset_name, "final_test_outputs")
+    ade, fde, n = evaluate(
+        model=model,
+        test_loader=test_loader,
+        motion_modes=motion_modes,
+        device=device,
+        obs_len=args.obs_len,
+        num_k=args.num_k,
+        save_traj=args.save_traj,
+        out_dir=out_dir if args.save_traj else None
+    )
+    print(f"[FINAL TEST] ADE={ade:.4f} | FDE={fde:.4f} | num_traj={n}")
+
+    # save metrics
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "metrics.txt"), "w", encoding="utf-8") as f:
+        f.write(f"ADE={ade:.6f}\nFDE={fde:.6f}\nnum_traj={n}\nckpt={ckpt_path}\nnum_k={args.num_k}\n")
+    print(f"[Saved] metrics to: {os.path.join(out_dir, 'metrics.txt')}")
+
+
+if __name__ == "__main__":
+    main()
