@@ -1,0 +1,12 @@
+# config/ETH_config.py
+batch_size = 64
+lr = 1e-3
+epoch = 30
+n_clusters = 50          
+smooth_size = 0
+random_rotation = False
+traj_seg = 12
+dist_threshold = 2.0
+model_hidden_dim = 128
+# 可选：分类损失权重
+# lambda_cls = 1.0
