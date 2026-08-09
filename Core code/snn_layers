@@ -1,0 +1,37 @@
+# snn_layers.py
+import torch
+import torch.nn as nn
+
+class LIFLayer(nn.Module):
+    """
+     LIF：输入 [B, T, D]，输出 [B, T, D]
+    有一个“膜电位积累 + 阈值发放”的时间动态。
+    """
+    def __init__(self, tau=2.0, v_th=1.0):
+        super().__init__()
+        self.tau = tau      # 泄露时间常数
+        self.v_th = v_th    # 放电阈值
+
+    def forward(self, x):
+        """
+        x: [B, T, D]
+        return: [B, T, D]
+        """
+        B, T, D = x.shape
+        # 初始膜电位 v0 = 0
+        v = x.new_zeros(B, D)
+        outputs = []
+
+        for t in range(T):
+            inp = x[:, t, :]                 # [B, D]
+            # 漏斗积分 v_t = v_{t-1} + (inp - v_{t-1}) / tau
+            v = v + (inp - v) / self.tau
+            # 超过阈值则触发脉冲
+            spike = (v >= self.v_th).float()  # [B, D]
+            # 放电后膜电位重置
+            v = v * (1.0 - spike)
+            # 输出：spike + v（既有脉冲也有一点连续态）
+            outputs.append(spike + v)
+
+        out = torch.stack(outputs, dim=1)     # [B, T, D]
+        return out
