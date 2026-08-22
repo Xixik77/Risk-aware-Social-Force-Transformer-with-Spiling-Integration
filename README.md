@@ -1,4 +1,4 @@
-# Risk-aware Social Force Transformer with Spiking Integration
+# Risk-Aware Physics-Guided Spiking Transformer
 
 This repository contains the code for the paper:
 
